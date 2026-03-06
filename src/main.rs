@@ -243,7 +243,7 @@ fn sender_loop(
         }
 
         if current_mode == LedMode::Sync {
-            match rx.recv_timeout(Duration::from_secs(1)) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(colors) => {
                     let mut color_data = Vec::with_capacity(colors.len() * 5);
                     for (i, &(r, g, b)) in colors.iter().enumerate() {
