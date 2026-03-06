@@ -1,0 +1,27 @@
+# 빌드 산출물
+/target/
+*.exe
+*.pdb
+
+# 사용자별 런타임 설정
+config.toml
+
+# OMC 플러그인 로컬 상태
+.omc/
+
+# 프로젝트 내부 메모 / 로컬 도구
+CLAUDE.md
+TODO.md
+bench.ps1
+
+# IDE / 에디터
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS 생성 파일
+Thumbs.db
+Desktop.ini
+.DS_Store
