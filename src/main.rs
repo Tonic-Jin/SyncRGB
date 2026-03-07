@@ -52,8 +52,10 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
     let active = Arc::new(AtomicBool::new(true));
     let config_version = Arc::new(AtomicU32::new(0));
+    let monitor_off = Arc::new(AtomicBool::new(false));
+    let screen_black = Arc::new(AtomicBool::new(false));
 
-    spawn_shutdown_listener(running.clone());
+    spawn_shutdown_listener(running.clone(), monitor_off.clone());
 
     let (tx, rx) = mpsc::sync_channel::<Vec<(u8, u8, u8)>>(2);
 
@@ -62,9 +64,10 @@ fn main() {
         let active = active.clone();
         let config_version = config_version.clone();
         let config = config.clone();
+        let screen_black = screen_black.clone();
         std::thread::Builder::new()
             .name("capture".into())
-            .spawn(move || capture_loop(config, running, active, config_version, tx))
+            .spawn(move || capture_loop(config, running, active, config_version, tx, screen_black))
             .expect("캡처 스레드 생성 실패")
     };
 
@@ -72,9 +75,11 @@ fn main() {
         let running = running.clone();
         let config_version = config_version.clone();
         let config = config.clone();
+        let monitor_off = monitor_off.clone();
+        let screen_black = screen_black.clone();
         std::thread::Builder::new()
             .name("sender".into())
-            .spawn(move || sender_loop(config, running, config_version, rx))
+            .spawn(move || sender_loop(config, running, config_version, rx, monitor_off, screen_black))
             .expect("전송 스레드 생성 실패")
     };
 
@@ -105,8 +110,10 @@ fn capture_loop(
     active: Arc<AtomicBool>,
     config_version: Arc<AtomicU32>,
     tx: mpsc::SyncSender<Vec<(u8, u8, u8)>>,
+    screen_black: Arc<AtomicBool>,
 ) {
     let mut frame_interval = Duration::from_millis(1000 / config.capture.fps as u64);
+    let mut turn_off_on_black = config.app.turn_off_on_black;
 
     let mut capturer = match ScreenCapture::new(config.capture.monitor) {
         Ok(c) => c,
@@ -129,6 +136,9 @@ fn capture_loop(
 
     log::info!("캡처 스레드 시작 ({}fps, {}x{})", config.capture.fps, capturer.width, capturer.height);
     let mut local_version = 0u32;
+    // 검정 화면 연속 프레임 카운터 (1초 이상 검정이면 플래그 설정)
+    let mut black_frame_count = 0u32;
+    let mut black_threshold_frames = config.capture.fps; // ~1초
 
     while running.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
@@ -138,6 +148,8 @@ fn capture_loop(
             local_version = current_version;
             let c = Config::load_or_default();
             frame_interval = Duration::from_millis(1000 / c.capture.fps as u64);
+            turn_off_on_black = c.app.turn_off_on_black;
+            black_threshold_frames = c.capture.fps;
             extractor.update_config(
                 c.device.lamps_amount, c.sync.gamma, c.sync.saturation,
                 c.sync.light_compression, c.sync.smoothing, c.sync.reverse, c.sync.edge_number,
@@ -152,6 +164,36 @@ fn capture_loop(
         match capturer.capture_frame() {
             Ok((data, pitch)) => {
                 let colors = extractor.extract(&data, pitch, capturer.width, capturer.height);
+
+                // 검정 화면 감지: 모든 LED 색상이 거의 검정인지 확인
+                const BLACK_SUM_THRESHOLD: u16 = 15;
+                if turn_off_on_black {
+                    let is_black = colors.iter().all(|&(r, g, b)| {
+                        (r as u16 + g as u16 + b as u16) < BLACK_SUM_THRESHOLD
+                    });
+                    if is_black {
+                        black_frame_count = black_frame_count.saturating_add(1);
+                    } else {
+                        if black_frame_count >= black_threshold_frames {
+                            log::info!("검정 화면 해제 — LED 복원");
+                        }
+                        black_frame_count = 0;
+                    }
+                    let was_black = screen_black.load(Ordering::Relaxed);
+                    let now_black = black_frame_count >= black_threshold_frames;
+                    if now_black != was_black {
+                        screen_black.store(now_black, Ordering::SeqCst);
+                        if now_black {
+                            log::info!("검정 화면 감지 — LED 끄기");
+                        }
+                    }
+                } else {
+                    if screen_black.load(Ordering::Relaxed) {
+                        screen_black.store(false, Ordering::SeqCst);
+                    }
+                    black_frame_count = 0;
+                }
+
                 let _ = tx.try_send(colors);
             }
             Err(CaptureError::Timeout) => {}
@@ -180,6 +222,8 @@ fn sender_loop(
     running: Arc<AtomicBool>,
     config_version: Arc<AtomicU32>,
     rx: mpsc::Receiver<Vec<(u8, u8, u8)>>,
+    monitor_off: Arc<AtomicBool>,
+    screen_black: Arc<AtomicBool>,
 ) {
     let mut wire_map = WireMap::from_str(&config.device.wire_map);
     let mut send_interval = Duration::from_millis(config.sync.interval_ms());
@@ -188,6 +232,8 @@ fn sender_loop(
     let mut light_compression = config.sync.light_compression;
     let mut current_mode = config.effect.mode.clone();
     let mut effect_cfg = config.effect.clone();
+    let mut turn_off_on_sleep = config.app.turn_off_on_sleep;
+    let mut turn_off_on_black = config.app.turn_off_on_black;
 
     // 디바이스 연결 (재시도)
     let mut conn = loop {
@@ -210,6 +256,7 @@ fn sender_loop(
     apply_mode(&conn, &effect_cfg, lamps_amount);
     let mut local_version = 0u32;
     let mut send_count = 0u64;
+    let mut blanked_by_screen = false;
 
     // 컴퓨터 리듬용 오디오 미터 (필요 시 초기화)
     let mut audio_meter: Option<audio::AudioMeter> = None;
@@ -235,11 +282,33 @@ fn sender_loop(
 
             lamps_amount = c.device.lamps_amount;
 
+            turn_off_on_sleep = c.app.turn_off_on_sleep;
+            turn_off_on_black = c.app.turn_off_on_black;
+
             if current_mode != c.effect.mode || effect_cfg_changed(&effect_cfg, &c.effect) {
                 current_mode = c.effect.mode.clone();
                 effect_cfg = c.effect.clone();
                 apply_mode(&conn, &effect_cfg, lamps_amount);
             }
+        }
+
+        // 모니터 절전 또는 검정 화면 시 LED 끄기
+        let should_blank = (turn_off_on_sleep && monitor_off.load(Ordering::Relaxed))
+            || (turn_off_on_black && screen_black.load(Ordering::Relaxed));
+        if should_blank {
+            if !blanked_by_screen {
+                log::info!("화면 꺼짐 감지 — LED 끄기");
+                let _ = conn.turn_off();
+                blanked_by_screen = true;
+            }
+            while rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        } else if blanked_by_screen {
+            log::info!("화면 복귀 — LED 복원");
+            blanked_by_screen = false;
+            let _ = conn.set_brightness(brightness);
+            apply_mode(&conn, &effect_cfg, lamps_amount);
         }
 
         if current_mode == LedMode::Sync {
@@ -505,13 +574,18 @@ fn create_gray_tray_icon() -> Icon {
 // ── Windows 종료 감지 (WM_ENDSESSION) ──
 
 static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+static MONITOR_OFF_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-fn spawn_shutdown_listener(running: Arc<AtomicBool>) {
+fn spawn_shutdown_listener(running: Arc<AtomicBool>, monitor_off: Arc<AtomicBool>) {
     SHUTDOWN_FLAG.set(running).ok();
+    MONITOR_OFF_FLAG.set(monitor_off).ok();
     std::thread::Builder::new()
         .name("shutdown".into())
         .spawn(|| unsafe {
             use windows::Win32::UI::WindowsAndMessaging::*;
+            use windows::Win32::System::Power::RegisterPowerSettingNotification;
+            use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+            use windows::Win32::Foundation::HANDLE;
 
             let class_name = windows::core::w!("SyncRGB_Shutdown");
             let wc = WNDCLASSW {
@@ -521,13 +595,21 @@ fn spawn_shutdown_listener(running: Arc<AtomicBool>) {
             };
             RegisterClassW(&wc);
 
-            // 숨겨진 top-level 윈도우 (WM_ENDSESSION 수신용)
-            let _ = CreateWindowExW(
+            // 숨겨진 top-level 윈도우 (WM_ENDSESSION + 전원 알림 수신용)
+            let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0), class_name,
                 windows::core::w!(""), WINDOW_STYLE(0),
                 0, 0, 0, 0,
                 None, None, None, None,
             );
+
+            // 모니터 전원 상태 변경 알림 등록
+            if let Ok(hwnd) = hwnd {
+                let _ = RegisterPowerSettingNotification(
+                    HANDLE(hwnd.0 as _), &GUID_CONSOLE_DISPLAY_STATE,
+                    REGISTER_NOTIFICATION_FLAGS(0),
+                );
+            }
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -550,6 +632,25 @@ unsafe extern "system" fn shutdown_wnd_proc(
                 std::thread::sleep(Duration::from_millis(800));
             }
             LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            use windows::Win32::System::Power::POWERBROADCAST_SETTING;
+            use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+            const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+            if wparam.0 == PBT_POWERSETTINGCHANGE && lparam.0 != 0 {
+                let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);
+                if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE {
+                    let state = setting.Data[0];
+                    if let Some(flag) = MONITOR_OFF_FLAG.get() {
+                        // 0 = 꺼짐, 1 = 켜짐, 2 = 어두워짐
+                        flag.store(state == 0, Ordering::SeqCst);
+                        log::info!("모니터 전원 상태: {}", match state {
+                            0 => "꺼짐", 1 => "켜짐", _ => "어두워짐"
+                        });
+                    }
+                }
+            }
+            LRESULT(1)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }

@@ -1,6 +1,6 @@
 [package]
 name = "SyncRGB"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "SyncRGB — 화면 색상을 USB LED에 동기화하는 경량 앱"
 
@@ -19,6 +19,8 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio_Endpoints",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Globalization",
+    "Win32_System_Power",
+    "Win32_System_SystemServices",
 ] }
 hidapi = "2.6"
 tray-icon = "0.17"

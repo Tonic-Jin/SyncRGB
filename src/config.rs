@@ -144,6 +144,10 @@ pub struct AppConfig {
     pub show_console: bool,
     #[serde(default)]
     pub language: Language,
+    #[serde(default)]
+    pub turn_off_on_sleep: bool,
+    #[serde(default)]
+    pub turn_off_on_black: bool,
 }
 
 impl Default for AppConfig {
@@ -152,6 +156,8 @@ impl Default for AppConfig {
             autostart: false,
             show_console: false,
             language: Language::Auto,
+            turn_off_on_sleep: false,
+            turn_off_on_black: false,
         }
     }
 }

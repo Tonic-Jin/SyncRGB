@@ -68,6 +68,8 @@ pub struct Locale {
     pub tray_paused_tooltip: &'static str,
     pub language_label: &'static str,
     pub lang_auto: &'static str,
+    pub turn_off_on_sleep: &'static str,
+    pub turn_off_on_black: &'static str,
 }
 
 static KO: Locale = Locale {
@@ -148,6 +150,8 @@ static KO: Locale = Locale {
     tray_paused_tooltip: "SyncRGB (일시정지)",
     language_label: "언어",
     lang_auto: "자동",
+    turn_off_on_sleep: "모니터 절전 시 LED 끄기",
+    turn_off_on_black: "검정 화면 시 LED 끄기",
 };
 
 static EN: Locale = Locale {
@@ -228,6 +232,8 @@ static EN: Locale = Locale {
     tray_paused_tooltip: "SyncRGB (Paused)",
     language_label: "Language",
     lang_auto: "Auto",
+    turn_off_on_sleep: "Turn off LEDs on monitor sleep",
+    turn_off_on_black: "Turn off LEDs on black screen",
 };
 
 pub fn resolve_locale(lang: &crate::config::Language) -> &'static Locale {
@@ -849,6 +855,12 @@ impl SettingsGui {
                 if let Err(e) = config::set_autostart(self.autostart) {
                     self.status_msg = format!("{}{}", locale.autostart_failed_prefix, e);
                 }
+            }
+            if ui.checkbox(&mut self.config.app.turn_off_on_sleep, locale.turn_off_on_sleep).changed() {
+                self.save_and_apply(ui.input(|i| i.time));
+            }
+            if ui.checkbox(&mut self.config.app.turn_off_on_black, locale.turn_off_on_black).changed() {
+                self.save_and_apply(ui.input(|i| i.time));
             }
         });
 
