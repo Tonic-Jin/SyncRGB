@@ -109,17 +109,30 @@ impl ScreenCapture {
                 }
             }
 
-            let resource = resource.ok_or(CaptureError::Other("리소스 없음".into()))?;
-            let texture: ID3D11Texture2D = resource.cast()
-                .map_err(|e: windows::core::Error| CaptureError::Other(format!("{}", e)))?;
+            // 프레임 획득 성공 — 이후 모든 경로에서 ReleaseFrame 호출 보장
+            let resource = match resource {
+                Some(r) => r,
+                None => {
+                    let _ = self.duplication.ReleaseFrame();
+                    return Err(CaptureError::Other("리소스 없음".into()));
+                }
+            };
 
-            // GPU 텍스처 → Staging 텍스처 복사
+            let texture: ID3D11Texture2D = match resource.cast() {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = self.duplication.ReleaseFrame();
+                    return Err(CaptureError::Other(format!("{}", e)));
+                }
+            };
+
             self.context.CopyResource(&self.staging, &texture);
 
-            // CPU에서 읽기
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| CaptureError::Other(format!("Map 실패: {}", e)))?;
+            if let Err(e) = self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+                let _ = self.duplication.ReleaseFrame();
+                return Err(CaptureError::Other(format!("Map 실패: {}", e)));
+            }
 
             let pitch = mapped.RowPitch;
             let data_size = (pitch * self.height) as usize;
@@ -134,6 +147,7 @@ impl ScreenCapture {
     }
 
     /// Desktop Duplication 재초기화 (AccessLost 시)
+    /// 해상도 변경도 감지하여 staging 텍스처 재생성
     pub fn reinitialize(&mut self, monitor_index: u32) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             let dxgi_device: IDXGIDevice = self.device.cast()?;
@@ -141,7 +155,36 @@ impl ScreenCapture {
             let output: IDXGIOutput = adapter.EnumOutputs(monitor_index)?;
             let output1: IDXGIOutput1 = output.cast()?;
             self.duplication = output1.DuplicateOutput(&self.device)?;
-            log::info!("Desktop Duplication 재초기화 완료");
+
+            // 해상도 변경 감지 → staging 텍스처 재생성
+            let desc = output.GetDesc()?;
+            let new_width = (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
+            let new_height = (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top) as u32;
+
+            if new_width != self.width || new_height != self.height {
+                log::info!("해상도 변경 감지: {}x{} → {}x{}", self.width, self.height, new_width, new_height);
+                self.width = new_width;
+                self.height = new_height;
+
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Width: new_width,
+                    Height: new_height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                };
+
+                let mut staging = None;
+                self.device.CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
+                self.staging = staging.ok_or("Staging 텍스처 재생성 실패")?;
+            }
+
+            log::info!("Desktop Duplication 재초기화 완료 ({}x{})", self.width, self.height);
             Ok(())
         }
     }

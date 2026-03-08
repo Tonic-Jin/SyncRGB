@@ -139,6 +139,8 @@ fn capture_loop(
     // 검정 화면 연속 프레임 카운터 (1초 이상 검정이면 플래그 설정)
     let mut black_frame_count = 0u32;
     let mut black_threshold_frames = config.capture.fps; // ~1초
+    // 연속 에러 카운터 (누적 시 DXGI 재초기화)
+    let mut consecutive_errors = 0u32;
 
     while running.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
@@ -163,6 +165,7 @@ fn capture_loop(
 
         match capturer.capture_frame() {
             Ok((data, pitch)) => {
+                consecutive_errors = 0;
                 let colors = extractor.extract(&data, pitch, capturer.width, capturer.height);
 
                 // 검정 화면 감지: 모든 LED 색상이 거의 검정인지 확인
@@ -205,7 +208,15 @@ fn capture_loop(
                 }
             }
             Err(e) => {
+                consecutive_errors += 1;
                 log::error!("캡처 오류: {}", e);
+                if consecutive_errors >= 30 {
+                    log::warn!("연속 오류 {}회 — DXGI 재초기화 시도", consecutive_errors);
+                    consecutive_errors = 0;
+                    if let Err(e) = capturer.reinitialize(Config::load_or_default().capture.monitor) {
+                        log::error!("재초기화 실패: {}", e);
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -257,6 +268,7 @@ fn sender_loop(
     let mut local_version = 0u32;
     let mut send_count = 0u64;
     let mut blanked_by_screen = false;
+    let mut send_errors: u32 = 0;
 
     // 컴퓨터 리듬용 오디오 미터 (필요 시 초기화)
     let mut audio_meter: Option<audio::AudioMeter> = None;
@@ -288,7 +300,18 @@ fn sender_loop(
             if current_mode != c.effect.mode || effect_cfg_changed(&effect_cfg, &c.effect) {
                 current_mode = c.effect.mode.clone();
                 effect_cfg = c.effect.clone();
-                apply_mode(&conn, &effect_cfg, lamps_amount);
+                if !apply_mode(&conn, &effect_cfg, lamps_amount) {
+                    // 모드 적용 실패 → 디바이스 재연결 후 재시도
+                    log::warn!("모드 적용 실패 — 디바이스 재연결 시도");
+                    if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                        let _ = c.init_device();
+                        let _ = c.set_brightness(brightness);
+                        conn = c;
+                        apply_mode(&conn, &effect_cfg, lamps_amount);
+                        send_errors = 0;
+                        log::info!("디바이스 재연결 성공");
+                    }
+                }
             }
         }
 
@@ -332,12 +355,22 @@ fn sender_loop(
                     }
                     send_count += 1;
 
-                    if let Err(e) = conn.set_sync_screen(&color_data) {
-                        log::error!("전송 실패: {} — 재연결", e);
-                        std::thread::sleep(Duration::from_secs(1));
-                        if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
-                            let _ = c.init_device();
-                            conn = c;
+                    match conn.set_sync_screen(&color_data) {
+                        Ok(()) => { send_errors = 0; }
+                        Err(e) => {
+                            send_errors += 1;
+                            if send_errors == 1 || send_errors % 10 == 0 {
+                                log::error!("전송 실패 ({}회): {}", send_errors, e);
+                            }
+                            std::thread::sleep(Duration::from_secs(1));
+                            if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                                let _ = c.init_device();
+                                let _ = c.set_brightness(brightness);
+                                conn = c;
+                                apply_mode(&conn, &effect_cfg, lamps_amount);
+                                send_errors = 0;
+                                log::info!("디바이스 재연결 성공");
+                            }
                         }
                     }
                 }
@@ -354,7 +387,25 @@ fn sender_loop(
             }
             if let Some(ref mut meter) = audio_meter {
                 let vol = meter.peak_volume();
-                let _ = conn.set_computer_rhythm(effect_cfg.sound_index, vol);
+                match conn.set_computer_rhythm(effect_cfg.sound_index, vol) {
+                    Ok(()) => { send_errors = 0; }
+                    Err(e) => {
+                        send_errors += 1;
+                        if send_errors == 1 || send_errors % 50 == 0 {
+                            log::warn!("리듬 전송 실패 ({}회): {}", send_errors, e);
+                        }
+                        if send_errors >= 50 {
+                            if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                                let _ = c.init_device();
+                                let _ = c.set_brightness(brightness);
+                                conn = c;
+                                apply_mode(&conn, &effect_cfg, lamps_amount);
+                                send_errors = 0;
+                                log::info!("디바이스 재연결 성공");
+                            }
+                        }
+                    }
+                }
             }
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(40));
@@ -368,11 +419,14 @@ fn sender_loop(
             match effect_cfg.soft_effect {
                 SoftEffect::Breathe => {
                     // 사인파로 밝기 변화 (0.05 ~ 1.0)
-                    let brightness = ((t.sin() + 1.0) / 2.0 * 0.95 + 0.05) as f32;
-                    let r = (effect_cfg.color_r as f32 * brightness) as u8;
-                    let g = (effect_cfg.color_g as f32 * brightness) as u8;
-                    let b = (effect_cfg.color_b as f32 * brightness) as u8;
-                    let _ = conn.set_section_led(r, g, b, lamps_amount);
+                    let bright = ((t.sin() + 1.0) / 2.0 * 0.95 + 0.05) as f32;
+                    let r = (effect_cfg.color_r as f32 * bright) as u8;
+                    let g = (effect_cfg.color_g as f32 * bright) as u8;
+                    let b = (effect_cfg.color_b as f32 * bright) as u8;
+                    match conn.set_section_led(r, g, b, lamps_amount) {
+                        Ok(()) => { send_errors = 0; }
+                        Err(_) => { send_errors += 1; }
+                    }
                 }
                 SoftEffect::Rotate => {
                     // LED 위치별 그라데이션 회전
@@ -392,9 +446,24 @@ fn sender_loop(
                         data.push(mapped[2]);
                         data.push(idx);
                     }
-                    let _ = conn.set_sync_screen(&data);
+                    match conn.set_sync_screen(&data) {
+                        Ok(()) => { send_errors = 0; }
+                        Err(_) => { send_errors += 1; }
+                    }
                 }
                 SoftEffect::None => {}
+            }
+            // Static 소프트 효과 모드 재연결
+            if send_errors >= 50 {
+                log::warn!("효과 전송 실패 {}회 — 재연결 시도", send_errors);
+                if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                    let _ = c.init_device();
+                    let _ = c.set_brightness(brightness);
+                    conn = c;
+                    apply_mode(&conn, &effect_cfg, lamps_amount);
+                    send_errors = 0;
+                    log::info!("디바이스 재연결 성공");
+                }
             }
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(30));
@@ -427,7 +496,8 @@ fn effect_cfg_changed(a: &config::EffectConfig, b: &config::EffectConfig) -> boo
         || a.soft_effect != b.soft_effect
 }
 
-fn apply_mode(conn: &DeviceConnection, effect: &config::EffectConfig, lamps_amount: u32) {
+/// 모드 적용. 성공 시 true, 실패 시 false 반환.
+fn apply_mode(conn: &DeviceConnection, effect: &config::EffectConfig, lamps_amount: u32) -> bool {
     log::info!("모드 적용: {:?}", effect.mode);
     let result = match effect.mode {
         LedMode::Sync => {
@@ -458,8 +528,12 @@ fn apply_mode(conn: &DeviceConnection, effect: &config::EffectConfig, lamps_amou
             conn.turn_off()
         }
     };
-    if let Err(e) = result {
-        log::warn!("모드 적용 실패: {}", e);
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("모드 적용 실패: {}", e);
+            false
+        }
     }
 }
 
