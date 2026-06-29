@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 
-use crate::config::{self, Config, LedMode, RhythmSource, SoftEffect};
+use crate::config::{self, ComputerAnalysis, Config, FreqPreset, LedMode, RhythmSource, SoftEffect};
 
 const WIRE_MAPS: &[&str] = &["RGB", "RBG", "GRB", "GBR", "BRG", "BGR"];
 
@@ -70,6 +70,19 @@ pub struct Locale {
     pub lang_auto: &'static str,
     pub turn_off_on_sleep: &'static str,
     pub turn_off_on_black: &'static str,
+    pub analysis_mode: &'static str,
+    pub analysis_legacy: &'static str,
+    pub analysis_frequency: &'static str,
+    pub freq_band: &'static str,
+    pub freq_presets: &'static [&'static str],   // Sub-bass, Bass, Mids, Treble, Custom
+    pub freq_custom_low: &'static str,
+    pub freq_custom_high: &'static str,
+    pub pulse_color: &'static str,
+    pub analysis_multiband: &'static str,
+    pub multiband_label: &'static str,
+    pub band_enabled: &'static str,
+    pub hw_patterns: &'static str,
+    pub sw_patterns: &'static str,
 }
 
 static KO: Locale = Locale {
@@ -130,6 +143,7 @@ static KO: Locale = Locale {
     sound_effects: &[
         "리듬 웨이브", "리듬 펄스", "리듬 스펙트럼",
         "리듬 플래시", "리듬 그라데이션", "리듬 체이스", "리듬 레인보우",
+        "색상 펄스", "미러 VU 바",
     ],
     color_presets: &[
         ("빨강", [255, 0, 0]),
@@ -152,6 +166,19 @@ static KO: Locale = Locale {
     lang_auto: "자동",
     turn_off_on_sleep: "모니터 절전 시 LED 끄기",
     turn_off_on_black: "검정 화면 시 LED 끄기",
+    analysis_mode: "분석 방식",
+    analysis_legacy: "레거시 (전체 볼륨)",
+    analysis_frequency: "주파수 대역",
+    freq_band: "주파수 대역",
+    freq_presets: &["서브 베이스", "베이스", "미드", "트레블", "커스텀"],
+    freq_custom_low: "하한 Hz",
+    freq_custom_high: "상한 Hz",
+    pulse_color: "펄스 색상",
+    analysis_multiband: "멀티밴드",
+    multiband_label: "멀티밴드 믹서",
+    band_enabled: "활성",
+    hw_patterns: "하드웨어 패턴",
+    sw_patterns: "소프트웨어 패턴",
 };
 
 static EN: Locale = Locale {
@@ -212,6 +239,7 @@ static EN: Locale = Locale {
     sound_effects: &[
         "Rhythm Wave", "Rhythm Pulse", "Rhythm Spectrum",
         "Rhythm Flash", "Rhythm Gradient", "Rhythm Chase", "Rhythm Rainbow",
+        "Color Pulse", "VU Bar",
     ],
     color_presets: &[
         ("Red", [255, 0, 0]),
@@ -234,6 +262,19 @@ static EN: Locale = Locale {
     lang_auto: "Auto",
     turn_off_on_sleep: "Turn off LEDs on monitor sleep",
     turn_off_on_black: "Turn off LEDs on black screen",
+    analysis_mode: "Analysis Mode",
+    analysis_legacy: "Legacy (Overall Volume)",
+    analysis_frequency: "Frequency Band",
+    freq_band: "Frequency Band",
+    freq_presets: &["Sub-bass", "Bass", "Mids", "Treble", "Custom"],
+    freq_custom_low: "Low Hz",
+    freq_custom_high: "High Hz",
+    pulse_color: "Pulse Color",
+    analysis_multiband: "Multi-band",
+    multiband_label: "Multi-band Mixer",
+    band_enabled: "On",
+    hw_patterns: "Built-in Patterns",
+    sw_patterns: "Software Patterns",
 };
 
 pub fn resolve_locale(lang: &crate::config::Language) -> &'static Locale {
@@ -254,11 +295,29 @@ pub fn detect_locale() -> &'static Locale {
     resolve_locale(&config.app.language)
 }
 
-/// 설정 GUI를 별도 프로세스로 실행
-pub fn open_settings() {
+/// 설정 GUI를 별도 프로세스로 실행. 자식 프로세스 핸들을 반환한다.
+pub fn open_settings() -> Option<std::process::Child> {
     if let Ok(exe) = std::env::current_exe() {
-        if let Err(e) = std::process::Command::new(exe).arg("--settings").spawn() {
-            log::error!("Failed to open settings GUI: {}", e);
+        match std::process::Command::new(exe).arg("--settings").spawn() {
+            Ok(child) => Some(child),
+            Err(e) => { log::error!("설정 창 열기 실패: {}", e); None }
+        }
+    } else {
+        None
+    }
+}
+
+/// 이미 열려 있는 설정 창을 전면으로 가져온다.
+pub fn focus_settings_window() {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+        use windows::core::PCWSTR;
+        let title: Vec<u16> = "SyncRGB\0".encode_utf16().collect();
+        if let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) {
+            if !hwnd.is_invalid() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
     }
 }
@@ -670,7 +729,7 @@ impl SettingsGui {
         egui::Grid::new("dynamic_grid").num_columns(cols).spacing([10.0, 10.0]).show(ui, |ui| {
             for (i, name) in locale.dynamic_effects.iter().enumerate() {
                 let selected = self.config.effect.dynamic_index == i as u8;
-                if effect_button(ui, name, colors[i], selected) {
+                if effect_button(ui, name, colors[i], selected, None) {
                     self.config.effect.dynamic_index = i as u8;
                     self.save_and_apply(ui.input(|i| i.time));
                 }
@@ -691,6 +750,7 @@ impl SettingsGui {
         let locale = self.locale;
         ui.add_space(4.0);
 
+        // ── 음악 소스 선택 ──────────────────────────────────────────────
         section(ui, locale.sound_source, |ui| {
             ui.horizontal(|ui| {
                 let mut changed = false;
@@ -700,11 +760,200 @@ impl SettingsGui {
             });
         });
 
+        // ── 컴퓨터 소스 선택 시: 분석 방식 + 주파수 대역 컨트롤 ─────────
+        if self.config.effect.rhythm_source == RhythmSource::Computer {
+            section(ui, locale.analysis_mode, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mut changed = false;
+                    if ui.selectable_value(
+                        &mut self.config.effect.computer_analysis,
+                        ComputerAnalysis::Legacy,
+                        locale.analysis_legacy,
+                    ).changed() { changed = true; }
+                    if ui.selectable_value(
+                        &mut self.config.effect.computer_analysis,
+                        ComputerAnalysis::Frequency,
+                        locale.analysis_frequency,
+                    ).changed() { changed = true; }
+                    if ui.selectable_value(
+                        &mut self.config.effect.computer_analysis,
+                        ComputerAnalysis::Multiband,
+                        locale.analysis_multiband,
+                    ).changed() { changed = true; }
+                    if changed { self.save_and_apply(ui.input(|i| i.time)); }
+                });
+            });
+
+            if self.config.effect.computer_analysis == ComputerAnalysis::Frequency {
+                // 프리셋 버튼 행
+                let preset_colors = [
+                    egui::Color32::from_rgb(60, 100, 220),   // Sub-bass: 진한 파랑
+                    egui::Color32::from_rgb(80, 160, 255),   // Bass: 파랑
+                    egui::Color32::from_rgb(80, 210, 140),   // Mids: 초록
+                    egui::Color32::from_rgb(255, 180, 50),   // Treble: 노랑
+                    egui::Color32::from_rgb(180, 100, 220),  // Custom: 보라
+                ];
+                let presets = [
+                    FreqPreset::SubBass,
+                    FreqPreset::Bass,
+                    FreqPreset::Mids,
+                    FreqPreset::Treble,
+                    FreqPreset::Custom,
+                ];
+
+                let preset_tooltips = [
+                    Some("20 – 60 Hz"),
+                    Some("60 – 250 Hz"),
+                    Some("250 – 2000 Hz"),
+                    Some("4000 – 16000 Hz"),
+                    None, // Custom: no fixed range
+                ];
+
+                section(ui, locale.freq_band, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, preset) in presets.iter().enumerate() {
+                            let selected = self.config.effect.freq_preset == *preset;
+                            let label = locale.freq_presets.get(i).copied().unwrap_or("?");
+                            if effect_button(ui, label, preset_colors[i], selected, preset_tooltips[i]) {
+                                self.config.effect.freq_preset = preset.clone();
+                                self.save_and_apply(ui.input(|i| i.time));
+                            }
+                        }
+                    });
+
+                    // 커스텀 범위 슬라이더
+                    if self.config.effect.freq_preset == FreqPreset::Custom {
+                        ui.add_space(8.0);
+                        egui::Grid::new("freq_custom_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label(locale.freq_custom_low);
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.config.effect.freq_custom_low, 20..=19999)
+                                        .suffix(" Hz")
+                                        .clamping(egui::SliderClamping::Always),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    // 하한이 상한 이상이면 조정
+                                    if self.config.effect.freq_custom_low >= self.config.effect.freq_custom_high {
+                                        self.config.effect.freq_custom_low =
+                                            self.config.effect.freq_custom_high.saturating_sub(1);
+                                    }
+                                    self.save_and_apply(ui.input(|i| i.time));
+                                }
+                                ui.end_row();
+
+                                ui.label(locale.freq_custom_high);
+                                let resp = ui.add(
+                                    egui::Slider::new(&mut self.config.effect.freq_custom_high, 21..=20000)
+                                        .suffix(" Hz")
+                                        .clamping(egui::SliderClamping::Always),
+                                );
+                                if resp.drag_stopped() || resp.lost_focus() {
+                                    if self.config.effect.freq_custom_high <= self.config.effect.freq_custom_low {
+                                        self.config.effect.freq_custom_high =
+                                            self.config.effect.freq_custom_low.saturating_add(1);
+                                    }
+                                    self.save_and_apply(ui.input(|i| i.time));
+                                }
+                                ui.end_row();
+                            });
+                    }
+                });
+            }
+
+            // ── 멀티밴드 믹서 에디터 ────────────────────────────────────
+            if self.config.effect.computer_analysis == ComputerAnalysis::Multiband {
+                section(ui, locale.multiband_label, |ui| {
+                    let bands_len = self.config.effect.multiband_bands.len();
+                    let mut changed = false;
+
+                    egui::Grid::new("multiband_grid")
+                        .num_columns(6)
+                        .spacing([6.0, 4.0])
+                        .show(ui, |ui| {
+                            // 헤더
+                            ui.label(locale.band_enabled);
+                            ui.label("");          // 색상
+                            ui.label(locale.freq_custom_low);
+                            ui.label("");
+                            ui.label(locale.freq_custom_high);
+                            ui.label("");
+                            ui.end_row();
+
+                            for idx in 0..bands_len {
+                                let band = &mut self.config.effect.multiband_bands[idx];
+
+                                // 활성 체크박스
+                                if ui.checkbox(&mut band.enabled, "").changed() { changed = true; }
+
+                                // 색상 선택기
+                                let mut color = egui::Color32::from_rgb(band.color_r, band.color_g, band.color_b);
+                                if egui::color_picker::color_edit_button_srgba(
+                                    ui, &mut color, egui::color_picker::Alpha::Opaque,
+                                ).changed() {
+                                    band.color_r = color.r();
+                                    band.color_g = color.g();
+                                    band.color_b = color.b();
+                                    changed = true;
+                                }
+
+                                // 하한 Hz
+                                if ui.add(
+                                    egui::DragValue::new(&mut band.low_hz)
+                                        .range(20..=19999)
+                                        .suffix(" Hz")
+                                        .speed(1.0),
+                                ).changed() {
+                                    if band.low_hz >= band.high_hz {
+                                        band.low_hz = band.high_hz.saturating_sub(1).max(20);
+                                    }
+                                    changed = true;
+                                }
+
+                                ui.label("–");
+
+                                // 상한 Hz
+                                if ui.add(
+                                    egui::DragValue::new(&mut band.high_hz)
+                                        .range(21..=20000)
+                                        .suffix(" Hz")
+                                        .speed(1.0),
+                                ).changed() {
+                                    if band.high_hz <= band.low_hz {
+                                        band.high_hz = band.low_hz.saturating_add(1).min(20000);
+                                    }
+                                    changed = true;
+                                }
+
+                                // 색상 미리보기 바
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(12.0, 20.0), egui::Sense::hover(),
+                                );
+                                let c = egui::Color32::from_rgb(
+                                    self.config.effect.multiband_bands[idx].color_r,
+                                    self.config.effect.multiband_bands[idx].color_g,
+                                    self.config.effect.multiband_bands[idx].color_b,
+                                );
+                                ui.painter().rect_filled(bar_rect, 2.0, c);
+
+                                ui.end_row();
+                            }
+                        });
+
+                    if changed {
+                        self.save_and_apply(ui.input(|i| i.time));
+                    }
+                });
+            }
+        }
+
         ui.label(egui::RichText::new(locale.pattern_hint).size(12.0).weak());
         ui.add_space(4.0);
 
         let cols = 3;
-        let colors = [
+        let hw_colors = [
             egui::Color32::from_rgb(255, 80, 80),
             egui::Color32::from_rgb(80, 255, 80),
             egui::Color32::from_rgb(80, 80, 255),
@@ -713,17 +962,67 @@ impl SettingsGui {
             egui::Color32::from_rgb(80, 220, 220),
             egui::Color32::from_rgb(255, 100, 200),
         ];
+        let hw_count = hw_colors.len(); // 7 hardware patterns (indices 0-6)
 
-        egui::Grid::new("sound_grid").num_columns(cols).spacing([10.0, 10.0]).show(ui, |ui| {
-            for (i, name) in locale.sound_effects.iter().enumerate() {
-                let selected = self.config.effect.sound_index == i as u8;
-                if effect_button(ui, name, colors[i], selected) {
-                    self.config.effect.sound_index = i as u8;
-                    self.save_and_apply(ui.input(|i| i.time));
+        // ── 하드웨어 패턴 (0-6) ──────────────────────────────────────
+        section(ui, locale.hw_patterns, |ui| {
+            egui::Grid::new("sound_hw_grid").num_columns(cols).spacing([10.0, 10.0]).show(ui, |ui| {
+                for i in 0..hw_count {
+                    let name = locale.sound_effects[i];
+                    let color = hw_colors[i];
+                    let selected = self.config.effect.sound_index == i as u8;
+                    if effect_button(ui, name, color, selected, None) {
+                        self.config.effect.sound_index = i as u8;
+                        self.save_and_apply(ui.input(|i| i.time));
+                    }
+                    if (i + 1) % cols == 0 { ui.end_row(); }
                 }
-                if (i + 1) % cols == 0 { ui.end_row(); }
-            }
+            });
         });
+
+        // ── 소프트웨어 패턴 (Computer 소스 전용) ─────────────────────
+        if self.config.effect.rhythm_source == RhythmSource::Computer {
+            section(ui, locale.sw_patterns, |ui| {
+                let sw_selected = self.config.effect.sound_index;
+                egui::Grid::new("sound_sw_grid").num_columns(cols).spacing([10.0, 10.0]).show(ui, |ui| {
+                    // Color Pulse (index 7)
+                    let cp_color = egui::Color32::from_rgb(255, 255, 255);
+                    if effect_button(ui, locale.sound_effects[7], cp_color, sw_selected == 7, None) {
+                        self.config.effect.sound_index = 7;
+                        self.save_and_apply(ui.input(|i| i.time));
+                    }
+                    // VU Bar (index 8)
+                    let vu_color = egui::Color32::from_rgb(0, 180, 255);
+                    if effect_button(ui, locale.sound_effects[8], vu_color, sw_selected == 8, None) {
+                        self.config.effect.sound_index = 8;
+                        self.save_and_apply(ui.input(|i| i.time));
+                    }
+                });
+
+                // Color Pulse 선택 시 색상 선택기
+                if sw_selected == 7 {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(locale.pulse_color);
+                        let mut color = egui::Color32::from_rgb(
+                            self.config.effect.pulse_color_r,
+                            self.config.effect.pulse_color_g,
+                            self.config.effect.pulse_color_b,
+                        );
+                        if egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut color,
+                            egui::color_picker::Alpha::Opaque,
+                        ).changed() {
+                            self.config.effect.pulse_color_r = color.r();
+                            self.config.effect.pulse_color_g = color.g();
+                            self.config.effect.pulse_color_b = color.b();
+                            self.save_and_apply(ui.input(|i| i.time));
+                        }
+                    });
+                }
+            });
+        }
     }
 
     fn draw_static_tab(&mut self, ui: &mut egui::Ui) {
@@ -885,7 +1184,7 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
     ui.add_space(4.0);
 }
 
-fn effect_button(ui: &mut egui::Ui, name: &str, color: egui::Color32, selected: bool) -> bool {
+fn effect_button(ui: &mut egui::Ui, name: &str, color: egui::Color32, selected: bool, tooltip: Option<&str>) -> bool {
     let size = egui::vec2(130.0, 48.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
 
@@ -919,5 +1218,10 @@ fn effect_button(ui: &mut egui::Ui, name: &str, color: egui::Color32, selected: 
         text_color,
     );
 
+    let resp = if let Some(tip) = tooltip {
+        resp.on_hover_text(tip)
+    } else {
+        resp
+    };
     resp.clicked()
 }

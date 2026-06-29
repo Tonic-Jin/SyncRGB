@@ -22,6 +22,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Power",
     "Win32_System_SystemServices",
 ] }
+rustfft = "6"
 hidapi = "2.6"
 tray-icon = "0.17"
 winit = { version = "0.30", features = ["rwh_06"] }

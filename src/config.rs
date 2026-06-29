@@ -69,7 +69,7 @@ pub enum RhythmSource {
 }
 
 impl Default for RhythmSource {
-    fn default() -> Self { Self::Controller }
+    fn default() -> Self { Self::Computer }
 }
 
 /// UI 언어
@@ -98,6 +98,49 @@ impl Default for SoftEffect {
     fn default() -> Self { Self::None }
 }
 
+/// 컴퓨터 오디오 분석 방식
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerAnalysis {
+    /// 기존 방식: WASAPI 피크 미터 (전체 볼륨)
+    Legacy,
+    /// FFT 로 단일 주파수 대역 측정
+    Frequency,
+    /// FFT 로 여러 주파수 대역을 측정하고 각 대역의 색상을 혼합
+    Multiband,
+}
+
+impl Default for ComputerAnalysis {
+    fn default() -> Self { Self::Frequency }
+}
+
+/// 멀티밴드 믹서의 개별 대역 설정
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct BandConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub low_hz: u32,
+    pub high_hz: u32,
+    pub color_r: u8,
+    pub color_g: u8,
+    pub color_b: u8,
+}
+
+/// 주파수 프리셋
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreqPreset {
+    SubBass,
+    Bass,
+    Mids,
+    Treble,
+    Custom,
+}
+
+impl Default for FreqPreset {
+    fn default() -> Self { Self::Bass }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EffectConfig {
     #[serde(default)]
@@ -118,6 +161,45 @@ pub struct EffectConfig {
     pub rhythm_source: RhythmSource,
     #[serde(default)]
     pub soft_effect: SoftEffect,
+    /// 컴퓨터 오디오 분석 방식 (기본: Legacy)
+    #[serde(default)]
+    pub computer_analysis: ComputerAnalysis,
+    /// 주파수 프리셋 (기본: Bass)
+    #[serde(default)]
+    pub freq_preset: FreqPreset,
+    /// 커스텀 주파수 하한 Hz (기본: 60)
+    #[serde(default = "default_freq_low")]
+    pub freq_custom_low: u32,
+    /// 커스텀 주파수 상한 Hz (기본: 250)
+    #[serde(default = "default_freq_high")]
+    pub freq_custom_high: u32,
+    /// 소프트웨어 펄스 색상 (기본: 파랑)
+    #[serde(default)]
+    pub pulse_color_r: u8,
+    #[serde(default)]
+    pub pulse_color_g: u8,
+    #[serde(default = "default_255")]
+    pub pulse_color_b: u8,
+    /// 멀티밴드 믹서 대역 설정
+    #[serde(default = "default_multiband_bands")]
+    pub multiband_bands: Vec<BandConfig>,
+}
+
+impl EffectConfig {
+    /// 현재 프리셋/커스텀 설정에 따른 주파수 범위 (Hz) 반환
+    pub fn freq_range(&self) -> (f32, f32) {
+        match self.freq_preset {
+            FreqPreset::SubBass => (20.0,   60.0),
+            FreqPreset::Bass    => (60.0,  250.0),
+            FreqPreset::Mids    => (250.0, 2000.0),
+            FreqPreset::Treble  => (4000.0, 16000.0),
+            FreqPreset::Custom  => {
+                let lo = (self.freq_custom_low as f32).max(20.0);
+                let hi = (self.freq_custom_high as f32).min(20000.0).max(lo + 1.0);
+                (lo, hi)
+            }
+        }
+    }
 }
 
 impl Default for EffectConfig {
@@ -130,8 +212,16 @@ impl Default for EffectConfig {
             color_g: 0,
             color_b: 255,
             effect_speed: 50,
-            rhythm_source: RhythmSource::Controller,
+            rhythm_source: RhythmSource::Computer,
             soft_effect: SoftEffect::None,
+            computer_analysis: ComputerAnalysis::Frequency,
+            freq_preset: FreqPreset::Bass,
+            freq_custom_low: 60,
+            freq_custom_high: 250,
+            pulse_color_r: 0,
+            pulse_color_g: 0,
+            pulse_color_b: 255,
+            multiband_bands: default_multiband_bands(),
         }
     }
 }
@@ -168,6 +258,16 @@ fn default_true() -> bool { true }
 fn default_edge_number() -> u8 { 3 }
 fn default_255() -> u8 { 255 }
 fn default_50() -> u8 { 50 }
+fn default_freq_low() -> u32 { 60 }
+fn default_freq_high() -> u32 { 250 }
+fn default_multiband_bands() -> Vec<BandConfig> {
+    vec![
+        BandConfig { enabled: true, low_hz:    20, high_hz:    60, color_r: 148, color_g:   0, color_b: 211 }, // Sub-bass: 보라
+        BandConfig { enabled: true, low_hz:    60, high_hz:   250, color_r: 255, color_g:  30, color_b:  30 }, // Bass: 빨강
+        BandConfig { enabled: true, low_hz:   250, high_hz:  2000, color_r:  30, color_g: 220, color_b:  30 }, // Mids: 초록
+        BandConfig { enabled: true, low_hz:  4000, high_hz: 16000, color_r:  30, color_g: 120, color_b: 255 }, // Treble: 파랑
+    ]
+}
 
 impl SyncConfig {
     pub fn interval_ms(&self) -> u64 {
