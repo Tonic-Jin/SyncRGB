@@ -24,7 +24,7 @@ use winit::window::WindowId;
 
 use capture::dxgi::{CaptureError, ScreenCapture};
 use color::extractor::ColorExtractor;
-use config::{Config, LedMode, RhythmSource, SoftEffect};
+use config::{Config, ComputerAnalysis, LedMode, RhythmSource, SoftEffect};
 use device::protocol::WireMap;
 use device::serial::DeviceConnection;
 
@@ -245,6 +245,7 @@ fn sender_loop(
     let mut effect_cfg = config.effect.clone();
     let mut turn_off_on_sleep = config.app.turn_off_on_sleep;
     let mut turn_off_on_black = config.app.turn_off_on_black;
+    let mut edge_number = config.sync.edge_number;
 
     // 디바이스 연결 (재시도)
     let mut conn = loop {
@@ -270,8 +271,14 @@ fn sender_loop(
     let mut blanked_by_screen = false;
     let mut send_errors: u32 = 0;
 
-    // 컴퓨터 리듬용 오디오 미터 (필요 시 초기화)
+    // 컴퓨터 리듬용 오디오 분석기 (필요 시 초기화)
     let mut audio_meter: Option<audio::AudioMeter> = None;
+    let mut loopback_analyzer: Option<audio::LoopbackAnalyzer> = None;
+    // 하드웨어 패턴 피크 홀드: decay 중 재시작 플리커 방지
+    let mut last_hw_vol: u8 = 0;
+    // 소프트웨어 VU Bar 상태
+    let mut vu_peak: f32 = 0.0;
+    let mut vu_peak_fall: f32 = 0.0;
     // 소프트웨어 효과 타이머
     let mut soft_tick: f64 = 0.0;
 
@@ -293,6 +300,7 @@ fn sender_loop(
             }
 
             lamps_amount = c.device.lamps_amount;
+            edge_number = c.sync.edge_number;
 
             turn_off_on_sleep = c.app.turn_off_on_sleep;
             turn_off_on_black = c.app.turn_off_on_black;
@@ -300,6 +308,8 @@ fn sender_loop(
             if current_mode != c.effect.mode || effect_cfg_changed(&effect_cfg, &c.effect) {
                 current_mode = c.effect.mode.clone();
                 effect_cfg = c.effect.clone();
+                last_hw_vol = 0;
+                vu_peak = 0.0; vu_peak_fall = 0.0;
                 if !apply_mode(&conn, &effect_cfg, lamps_amount) {
                     // 모드 적용 실패 → 디바이스 재연결 후 재시도
                     log::warn!("모드 적용 실패 — 디바이스 재연결 시도");
@@ -378,21 +388,92 @@ fn sender_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         } else if current_mode == LedMode::Sound && effect_cfg.rhythm_source == RhythmSource::Computer {
-            // 컴퓨터 리듬: 오디오 볼륨 → setComputerRhythm 반복
-            if audio_meter.is_none() {
-                audio_meter = audio::AudioMeter::new().ok();
-                if audio_meter.is_none() {
-                    log::warn!("오디오 미터 초기화 실패");
+            // ── 멀티밴드 모드: 항상 소프트웨어 구동, 색상 혼합 후 set_section_led ──
+            if effect_cfg.computer_analysis == ComputerAnalysis::Multiband {
+                audio_meter = None;
+                if loopback_analyzer.is_none() {
+                    match audio::LoopbackAnalyzer::new() {
+                        Ok(a) => { loopback_analyzer = Some(a); }
+                        Err(e) => { log::warn!("루프백 분석기 초기화 실패: {}", e); }
+                    }
                 }
+                if let Some(ref mut analyzer) = loopback_analyzer {
+                    let (mut sr, mut sg, mut sb) = (0u32, 0u32, 0u32);
+                    for band in &effect_cfg.multiband_bands {
+                        if !band.enabled { continue; }
+                        let lv = analyzer.band_level(band.low_hz as f32, band.high_hz as f32);
+                        let f = lv as f32 / 100.0;
+                        sr += (band.color_r as f32 * f) as u32;
+                        sg += (band.color_g as f32 * f) as u32;
+                        sb += (band.color_b as f32 * f) as u32;
+                    }
+                    let r = sr.min(255) as u8;
+                    let g = sg.min(255) as u8;
+                    let b = sb.min(255) as u8;
+                    match conn.set_section_led(r, g, b, lamps_amount) {
+                        Ok(()) => { send_errors = 0; }
+                        Err(e) => {
+                            send_errors += 1;
+                            if send_errors == 1 || send_errors % 50 == 0 {
+                                log::warn!("멀티밴드 전송 실패 ({}회): {}", send_errors, e);
+                            }
+                            if send_errors >= 50 {
+                                if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                                    let _ = c.init_device();
+                                    let _ = c.set_brightness(brightness);
+                                    conn = c;
+                                    apply_mode(&conn, &effect_cfg, lamps_amount);
+                                    send_errors = 0;
+                                    log::info!("디바이스 재연결 성공");
+                                }
+                            }
+                        }
+                    }
+                }
+                while rx.try_recv().is_ok() {}
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
             }
-            if let Some(ref mut meter) = audio_meter {
-                let vol = meter.peak_volume();
-                match conn.set_computer_rhythm(effect_cfg.sound_index, vol) {
+
+            // ── 단일 볼륨 모드 (Legacy / Frequency) ──────────────────────
+            let vol = match effect_cfg.computer_analysis {
+                ComputerAnalysis::Legacy => {
+                    // 레거시 모드: 전체 피크 미터
+                    loopback_analyzer = None;
+                    if audio_meter.is_none() {
+                        audio_meter = audio::AudioMeter::new().ok();
+                        if audio_meter.is_none() {
+                            log::warn!("오디오 미터 초기화 실패");
+                        }
+                    }
+                    audio_meter.as_mut().map(|m| m.peak_volume()).unwrap_or(0)
+                }
+                ComputerAnalysis::Frequency => {
+                    // 주파수 대역 모드: FFT 루프백 분석
+                    audio_meter = None;
+                    if loopback_analyzer.is_none() {
+                        match audio::LoopbackAnalyzer::new() {
+                            Ok(a) => { loopback_analyzer = Some(a); }
+                            Err(e) => { log::warn!("루프백 분석기 초기화 실패: {}", e); }
+                        }
+                    }
+                    let (lo, hi) = effect_cfg.freq_range();
+                    loopback_analyzer.as_mut().map(|a| a.band_level(lo, hi)).unwrap_or(0)
+                }
+                ComputerAnalysis::Multiband => unreachable!(),
+            };
+            // ── 소프트웨어 효과: Color Pulse (index 7) ───────────────────
+            if effect_cfg.sound_index == 7 {
+                let factor = vol as f32 / 100.0;
+                let r = (effect_cfg.pulse_color_r as f32 * factor) as u8;
+                let g = (effect_cfg.pulse_color_g as f32 * factor) as u8;
+                let b = (effect_cfg.pulse_color_b as f32 * factor) as u8;
+                match conn.set_section_led(r, g, b, lamps_amount) {
                     Ok(()) => { send_errors = 0; }
                     Err(e) => {
                         send_errors += 1;
                         if send_errors == 1 || send_errors % 50 == 0 {
-                            log::warn!("리듬 전송 실패 ({}회): {}", send_errors, e);
+                            log::warn!("펄스 전송 실패 ({}회): {}", send_errors, e);
                         }
                         if send_errors >= 50 {
                             if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
@@ -403,6 +484,93 @@ fn sender_loop(
                                 send_errors = 0;
                                 log::info!("디바이스 재연결 성공");
                             }
+                        }
+                    }
+                }
+                while rx.try_recv().is_ok() {}
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
+            // ── 소프트웨어 효과: VU Bar (index 8+) ────────────────
+            if effect_cfg.sound_index >= 8 {
+                let fill = vol as f32 / 100.0;
+                if fill >= vu_peak {
+                    vu_peak = fill;
+                    vu_peak_fall = 0.0;
+                } else {
+                    vu_peak_fall = (vu_peak_fall + 0.0015_f32).min(0.015);
+                    vu_peak = (vu_peak - vu_peak_fall).max(0.0);
+                }
+                let (left_n, top_n, right_n, bot_n) = compute_edge_leds(lamps_amount, edge_number);
+                let n = lamps_amount as usize;
+                let mut color_data = Vec::with_capacity(n * 5);
+                for i in 0..left_n {
+                    let idx = (i + 1) as u8;
+                    let t = if left_n > 1 { i as f32 / (left_n - 1) as f32 } else { 0.5 };
+                    let (r, g, b) = led_vu(t, fill, vu_peak, left_n);
+                    let m = wire_map.apply(r, g, b);
+                    color_data.extend_from_slice(&[idx, m[0], m[1], m[2], idx]);
+                }
+                for i in 0..top_n {
+                    let idx = (left_n + i + 1) as u8;
+                    color_data.extend_from_slice(&[idx, 0, 0, 0, idx]);
+                }
+                for i in 0..right_n {
+                    let idx = (left_n + top_n + i + 1) as u8;
+                    let t = if right_n > 1 { (right_n - 1 - i) as f32 / (right_n - 1) as f32 } else { 0.5 };
+                    let (r, g, b) = led_vu(t, fill, vu_peak, right_n);
+                    let m = wire_map.apply(r, g, b);
+                    color_data.extend_from_slice(&[idx, m[0], m[1], m[2], idx]);
+                }
+                for i in 0..bot_n {
+                    let idx = (left_n + top_n + right_n + i + 1) as u8;
+                    color_data.extend_from_slice(&[idx, 0, 0, 0, idx]);
+                }
+                match conn.set_sync_screen(&color_data) {
+                    Ok(()) => { send_errors = 0; }
+                    Err(e) => {
+                        send_errors += 1;
+                        if send_errors == 1 || send_errors % 50 == 0 {
+                            log::warn!("VU 미러 전송 실패 ({}회): {}", send_errors, e);
+                        }
+                        if send_errors >= 50 {
+                            if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                                let _ = c.init_device();
+                                let _ = c.set_brightness(brightness);
+                                conn = c;
+                                apply_mode(&conn, &effect_cfg, lamps_amount);
+                                send_errors = 0;
+                                log::info!("디바이스 재연결 성공");
+                            }
+                        }
+                    }
+                }
+                while rx.try_recv().is_ok() {}
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
+            // ── 하드웨어 패턴 (index 0-6): set_computer_rhythm ───────────
+            let hw_vol = if vol >= last_hw_vol || vol == 0 {
+                last_hw_vol = vol;
+                vol
+            } else {
+                last_hw_vol
+            };
+            match conn.set_computer_rhythm(effect_cfg.sound_index, hw_vol) {
+                Ok(()) => { send_errors = 0; }
+                Err(e) => {
+                    send_errors += 1;
+                    if send_errors == 1 || send_errors % 50 == 0 {
+                        log::warn!("리듬 전송 실패 ({}회): {}", send_errors, e);
+                    }
+                    if send_errors >= 50 {
+                        if let Ok(mut c) = DeviceConnection::connect(&Config::load_or_default().device.com_port) {
+                            let _ = c.init_device();
+                            let _ = c.set_brightness(brightness);
+                            conn = c;
+                            apply_mode(&conn, &effect_cfg, lamps_amount);
+                            send_errors = 0;
+                            log::info!("디바이스 재연결 성공");
                         }
                     }
                 }
@@ -494,6 +662,11 @@ fn effect_cfg_changed(a: &config::EffectConfig, b: &config::EffectConfig) -> boo
         || a.effect_speed != b.effect_speed
         || a.rhythm_source != b.rhythm_source
         || a.soft_effect != b.soft_effect
+        || a.computer_analysis != b.computer_analysis
+        || a.freq_preset != b.freq_preset
+        || a.freq_custom_low != b.freq_custom_low
+        || a.freq_custom_high != b.freq_custom_high
+        || a.multiband_bands != b.multiband_bands
 }
 
 /// 모드 적용. 성공 시 true, 실패 시 false 반환.
@@ -515,10 +688,16 @@ fn apply_mode(conn: &DeviceConnection, effect: &config::EffectConfig, lamps_amou
             conn.set_dynamic_speed(effect.effect_speed)
         }
         LedMode::Sound => {
-            // 원본 흐름: setSectionLED → setLedEffect(3=음악, index)
             conn.set_section_led(0, 0, 0, lamps_amount).ok();
             std::thread::sleep(Duration::from_millis(20));
-            conn.set_led_effect(3, effect.sound_index)
+            // 소프트웨어 구동 효과(Color Pulse, VU Bar, Multiband)는 set_led_effect 불필요
+            let software_driven = effect.rhythm_source == RhythmSource::Computer
+                && (effect.sound_index >= 7 || effect.computer_analysis == ComputerAnalysis::Multiband);
+            if software_driven {
+                Ok(())
+            } else {
+                conn.set_led_effect(3, effect.sound_index.min(6))
+            }
         }
         LedMode::Static => {
             // setSectionLED로 단색 전송
@@ -534,6 +713,52 @@ fn apply_mode(conn: &DeviceConnection, effect: &config::EffectConfig, lamps_amou
             log::warn!("모드 적용 실패: {}", e);
             false
         }
+    }
+}
+
+/// 에지별 LED 배분 (left, top, right, bottom) — 16:9 비율 기준
+fn compute_edge_leds(lamps: u32, edge_number: u8) -> (usize, usize, usize, usize) {
+    let rows: u32 = 9;
+    let cols: u32 = 16;
+    let total: u32 = if edge_number >= 4 { 2 * rows + 2 * cols } else { 2 * rows + cols };
+    let left  = (lamps * rows / total) as usize;
+    let right = (lamps * rows / total) as usize;
+    let remainder = lamps as usize - left - right;
+    let (top, bottom) = if edge_number >= 4 {
+        let t = (lamps * cols / total) as usize;
+        (t, remainder - t)
+    } else {
+        (remainder, 0)
+    };
+    (left, top, right, bottom)
+}
+
+/// VU 바 색상 그라디언트: t=0(물리 아래) → t=1(물리 위), 파랑→시안→초록→노랑→빨강
+fn vu_color(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.25 {
+        let p = t / 0.25;
+        (0, (p * 180.0) as u8, 255)
+    } else if t < 0.5 {
+        let p = (t - 0.25) / 0.25;
+        (0, (180.0 + p * 75.0) as u8, (255.0 * (1.0 - p)) as u8)
+    } else if t < 0.75 {
+        let p = (t - 0.5) / 0.25;
+        ((p * 255.0) as u8, 255, 0)
+    } else {
+        let p = (t - 0.75) / 0.25;
+        (255, (255.0 * (1.0 - p)) as u8, 0)
+    }
+}
+
+/// 단일 LED의 VU 바 색상 결정 (fill 이하 → 그라디언트, 피크 위치 → 흰 점, 나머지 → 꺼짐)
+fn led_vu(t: f32, fill: f32, peak: f32, edge_n: usize) -> (u8, u8, u8) {
+    if t <= fill {
+        vu_color(t)
+    } else if peak > 0.02 && (t - peak).abs() <= 1.0 / edge_n.max(1) as f32 {
+        (180, 180, 180)
+    } else {
+        (0, 0, 0)
     }
 }
 
@@ -738,6 +963,7 @@ fn run_tray(running: Arc<AtomicBool>, active: Arc<AtomicBool>, config_version: A
         last_mtime: None, tick_counter: 0,
         tray: None, toggle_item: None, settings_item: None, quit_item: None,
         locale,
+        settings_child: None,
     };
     event_loop.run_app(&mut app).ok();
 }
@@ -754,6 +980,7 @@ struct TrayApp {
     settings_item: Option<MenuItem>,
     quit_item: Option<MenuItem>,
     locale: &'static gui::Locale,
+    settings_child: Option<std::process::Child>,
 }
 
 impl ApplicationHandler for TrayApp {
@@ -807,10 +1034,23 @@ impl ApplicationHandler for TrayApp {
                 }
             }
             if let Some(ref s) = self.settings_item {
-                if event.id() == s.id() { gui::open_settings(); }
+                if event.id() == s.id() {
+                    let already_open = self.settings_child.as_mut()
+                        .and_then(|c| c.try_wait().ok())
+                        .map(|status| status.is_none())
+                        .unwrap_or(false);
+                    if already_open {
+                        gui::focus_settings_window();
+                    } else {
+                        self.settings_child = gui::open_settings();
+                    }
+                }
             }
             if let Some(ref q) = self.quit_item {
                 if event.id() == q.id() {
+                    if let Some(ref mut child) = self.settings_child {
+                        let _ = child.kill();
+                    }
                     self.running.store(false, Ordering::Relaxed);
                     event_loop.exit();
                 }
