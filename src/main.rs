@@ -34,9 +34,12 @@ fn main() {
         unsafe { attach_console(); }
     }
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    init_logging();
+
+    // panic=abort + 콘솔 없음 조합에서 패닉이 흔적 없이 사라지는 것 방지
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("패닉: {}", info);
+    }));
 
     if std::env::args().any(|a| a == "--settings") {
         gui::run_settings_window();
@@ -90,6 +93,26 @@ fn main() {
     let _ = capture_thread.join();
     let _ = send_thread.join();
     log::info!("SyncRGB 종료");
+}
+
+/// 로거 초기화. windows_subsystem="windows" 빌드에서 stderr는 유실되므로
+/// exe 옆 syncrgb.log에 기록한다 (--console 시에는 기존대로 콘솔 출력).
+fn init_logging() {
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    builder.format_timestamp_millis();
+
+    if !std::env::args().any(|a| a == "--console") {
+        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            let path = dir.join("syncrgb.log");
+            if std::fs::metadata(&path).map_or(false, |m| m.len() > 1_000_000) {
+                let _ = std::fs::rename(&path, dir.join("syncrgb.log.old"));
+            }
+            if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+        }
+    }
+    builder.init();
 }
 
 /// 릴리즈 빌드에서 콘솔 붙이기
@@ -270,6 +293,11 @@ fn sender_loop(
     let mut blanked_by_screen = false;
     let mut send_errors: u32 = 0;
 
+    // 먹통 감시: 주기적으로 getDeviceInfo 응답을 확인해 hang 발생 시점을 로그에 남긴다
+    const PROBE_INTERVAL: Duration = Duration::from_secs(300);
+    let mut last_probe = Instant::now();
+    let mut device_alive = true;
+
     // 컴퓨터 리듬용 오디오 미터 (필요 시 초기화)
     let mut audio_meter: Option<audio::AudioMeter> = None;
     // 소프트웨어 효과 타이머
@@ -311,6 +339,19 @@ fn sender_loop(
                         send_errors = 0;
                         log::info!("디바이스 재연결 성공");
                     }
+                }
+            }
+        }
+
+        if last_probe.elapsed() >= PROBE_INTERVAL {
+            last_probe = Instant::now();
+            let alive = conn.probe();
+            if alive != device_alive {
+                device_alive = alive;
+                if alive {
+                    log::info!("디바이스 응답 회복");
+                } else {
+                    log::error!("디바이스 응답 없음 — 펌웨어 먹통 의심. 트레이 'USB 리셋' 시도, 안 되면 물리 재연결 필요");
                 }
             }
         }
@@ -423,7 +464,20 @@ fn sender_loop(
                     let r = (effect_cfg.color_r as f32 * bright) as u8;
                     let g = (effect_cfg.color_g as f32 * bright) as u8;
                     let b = (effect_cfg.color_b as f32 * bright) as u8;
-                    match conn.set_section_led(r, g, b, lamps_amount) {
+                    // setSectionLED(0x86)는 단발성 색 변경 명령 — 33Hz 연사 시 펌웨어 먹통 위험.
+                    // Rotate와 동일하게 스트리밍 전용 SC(setSyncScreen) 경로로 전송한다.
+                    let mapped = wire_map.apply(r, g, b);
+                    let n = lamps_amount as usize;
+                    let mut data = Vec::with_capacity(n * 5);
+                    for i in 0..n {
+                        let idx = (i + 1) as u8;
+                        data.push(idx);
+                        data.push(mapped[0]);
+                        data.push(mapped[1]);
+                        data.push(mapped[2]);
+                        data.push(idx);
+                    }
+                    match conn.set_sync_screen(&data) {
                         Ok(()) => { send_errors = 0; }
                         Err(_) => { send_errors += 1; }
                     }
@@ -626,6 +680,29 @@ fn low_light_for_sync(data: &mut [u8], saturation: bool, compression: bool) {
     }
 }
 
+/// 먹통 디바이스 복구 시도: 관리자 권한 pnputil로 USB 디바이스 재시작 (UAC 프롬프트 발생).
+/// PnP 재시작은 버스 리셋까지만 하고 VBUS 전원은 유지되므로,
+/// 이걸로도 안 살아나는 완전 먹통이면 물리 재연결만 유효하다.
+/// 인스턴스 경로의 시리얼 "0123456789"는 펌웨어 고정값이라 포트를 옮겨도 동일.
+fn usb_reset_device() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    log::info!("USB 디바이스 리셋 시도 (pnputil, UAC 승인 필요)");
+    let instance = format!(r"USB\VID_{:04X}&PID_{:04X}\0123456789",
+        device::serial::VENDOR_ID, device::serial::PRODUCT_ID);
+    let ps_cmd = format!(
+        "Start-Process pnputil -Verb RunAs -WindowStyle Hidden -ArgumentList '/restart-device','{}'",
+        instance);
+    if let Err(e) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        log::error!("USB 리셋 실행 실패: {}", e);
+    }
+}
+
 fn create_rgb_tray_icon() -> Icon {
     let size = 32u32;
     let rgba = gui::generate_rgb_icon(size);
@@ -736,7 +813,7 @@ fn run_tray(running: Arc<AtomicBool>, active: Arc<AtomicBool>, config_version: A
         running, active, config_version,
         config_path: Config::config_path(),
         last_mtime: None, tick_counter: 0,
-        tray: None, toggle_item: None, settings_item: None, quit_item: None,
+        tray: None, toggle_item: None, settings_item: None, reset_item: None, quit_item: None,
         locale,
     };
     event_loop.run_app(&mut app).ok();
@@ -752,6 +829,7 @@ struct TrayApp {
     tray: Option<TrayIcon>,
     toggle_item: Option<MenuItem>,
     settings_item: Option<MenuItem>,
+    reset_item: Option<MenuItem>,
     quit_item: Option<MenuItem>,
     locale: &'static gui::Locale,
 }
@@ -763,9 +841,11 @@ impl ApplicationHandler for TrayApp {
         let menu = Menu::new();
         let toggle = MenuItem::new(self.locale.tray_pause, true, None);
         let settings = MenuItem::new(self.locale.tray_settings, true, None);
+        let reset = MenuItem::new(self.locale.tray_reset_usb, true, None);
         let quit = MenuItem::new(self.locale.tray_quit, true, None);
         menu.append(&toggle).ok();
         menu.append(&settings).ok();
+        menu.append(&reset).ok();
         menu.append(&PredefinedMenuItem::separator()).ok();
         menu.append(&quit).ok();
 
@@ -778,6 +858,7 @@ impl ApplicationHandler for TrayApp {
 
         self.toggle_item = Some(toggle);
         self.settings_item = Some(settings);
+        self.reset_item = Some(reset);
         self.quit_item = Some(quit);
         self.tray = Some(tray);
         self.last_mtime = std::fs::metadata(&self.config_path).ok().and_then(|m| m.modified().ok());
@@ -808,6 +889,9 @@ impl ApplicationHandler for TrayApp {
             }
             if let Some(ref s) = self.settings_item {
                 if event.id() == s.id() { gui::open_settings(); }
+            }
+            if let Some(ref r) = self.reset_item {
+                if event.id() == r.id() { usb_reset_device(); }
             }
             if let Some(ref q) = self.quit_item {
                 if event.id() == q.id() {

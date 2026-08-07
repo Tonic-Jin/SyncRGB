@@ -4,11 +4,25 @@ use std::time::Duration;
 use super::protocol;
 
 /// Robobloq LED 디바이스 (USB HID)
-const VENDOR_ID: u16 = 0x1A86;
-const PRODUCT_ID: u16 = 0xFE07;
+pub const VENDOR_ID: u16 = 0x1A86;
+pub const PRODUCT_ID: u16 = 0xFE07;
 
 /// 쓰기 후 대기 시간 (ms) — SyncLight 원본: 200ms
 const WRITE_DELAY_MS: u64 = 200;
+
+/// 청크(HID 리포트) 간 최소 간격 (µs).
+/// 원본 SyncLight(Electron)은 JS 이벤트 루프 오버헤드로 리포트 사이에 자연스러운
+/// 간격이 있었지만 Rust는 back-to-back 전송이라 디바이스 MCU(CH55x급) 수신 버퍼가
+/// 따라오지 못해 펌웨어가 먹통(USB 재삽입 전까지 무응답)이 될 수 있다.
+/// thread::sleep은 Windows 타이머 해상도(최대 ~15ms) 문제로 spin-wait 사용.
+const INTER_CHUNK_GAP_US: u64 = 500;
+
+fn inter_chunk_pause() {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_micros(INTER_CHUNK_GAP_US) {
+        std::hint::spin_loop();
+    }
+}
 
 /// HID 연결 관리자
 pub struct DeviceConnection {
@@ -28,12 +42,16 @@ impl DeviceConnection {
                     && d.interface_number() == 0
             })
             .ok_or_else(|| {
-                log::warn!("HID 디바이스 목록:");
-                for dev in api.device_list() {
-                    log::warn!("  VID={:#06x} PID={:#06x} page={:#06x} if={} {:?}",
-                        dev.vendor_id(), dev.product_id(),
-                        dev.usage_page(), dev.interface_number(),
-                        dev.product_string().unwrap_or_default());
+                // 목록 덤프는 프로세스당 1회만 — 3초 재시도마다 찍으면 파일 로그가 폭주한다
+                static LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !LISTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("HID 디바이스 목록:");
+                    for dev in api.device_list() {
+                        log::warn!("  VID={:#06x} PID={:#06x} page={:#06x} if={} {:?}",
+                            dev.vendor_id(), dev.product_id(),
+                            dev.usage_page(), dev.interface_number(),
+                            dev.product_string().unwrap_or_default());
+                    }
                 }
                 format!("Robobloq HID 디바이스를 찾을 수 없음 (VID={:#06x}, PID={:#06x})",
                     VENDOR_ID, PRODUCT_ID)
@@ -63,7 +81,8 @@ impl DeviceConnection {
 
     /// 패킷 전송 (64바이트 청킹) — writeWithoutResponse
     pub fn write_without_response(&self, packet: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        for chunk in &protocol::chunk_packet(packet) {
+        for (i, chunk) in protocol::chunk_packet(packet).iter().enumerate() {
+            if i > 0 { inter_chunk_pause(); }
             self.hid_write(chunk)?;
         }
         Ok(())
@@ -71,7 +90,8 @@ impl DeviceConnection {
 
     /// 패킷 전송 + 응답 대기 — write (200ms 딜레이)
     fn write_with_response(&self, packet: &[u8]) -> Result<Option<protocol::RbResponse>, Box<dyn std::error::Error>> {
-        for chunk in &protocol::chunk_packet(packet) {
+        for (i, chunk) in protocol::chunk_packet(packet).iter().enumerate() {
+            if i > 0 { inter_chunk_pause(); }
             self.hid_write(chunk)?;
         }
 
@@ -100,10 +120,19 @@ impl DeviceConnection {
                     self.mac[0], self.mac[1], self.mac[2],
                     self.mac[3], self.mac[4], self.mac[5]);
             }
+        } else {
+            log::warn!("getDeviceInfo 응답 없음 — 디바이스가 먹통 상태일 수 있음 (USB 재연결 필요 가능성)");
         }
 
         std::thread::sleep(Duration::from_millis(80));
         Ok(())
+    }
+
+    /// 디바이스 생존 확인 — getDeviceInfo에 응답이 오면 true.
+    /// 먹통(펌웨어 hang) 상태면 enumeration은 살아 있어도 응답이 없다.
+    pub fn probe(&self) -> bool {
+        let packet = protocol::get_device_info();
+        matches!(self.write_with_response(&packet), Ok(Some(_)))
     }
 
     // ── 화면 동기화 ──
