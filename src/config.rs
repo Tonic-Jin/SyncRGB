@@ -196,7 +196,7 @@ impl Config {
             if candidate.exists() {
                 match Self::load(candidate) {
                     Ok(cfg) => {
-                        log::info!("설정 로드 완료: {}", candidate.display());
+                        log::debug!("설정 로드 완료: {}", candidate.display());
                         return cfg;
                     }
                     Err(e) => {

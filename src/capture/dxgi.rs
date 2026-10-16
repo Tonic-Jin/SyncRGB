@@ -184,7 +184,7 @@ impl ScreenCapture {
                 self.staging = staging.ok_or("Staging 텍스처 재생성 실패")?;
             }
 
-            log::info!("Desktop Duplication 재초기화 완료 ({}x{})", self.width, self.height);
+            log::debug!("Desktop Duplication 재초기화 완료 ({}x{})", self.width, self.height);
             Ok(())
         }
     }

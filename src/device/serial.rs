@@ -24,6 +24,25 @@ fn inter_chunk_pause() {
     }
 }
 
+/// 쓰기 실패의 종류. 로그(2026-10-15)에서 확인한 두 서명:
+/// - 먹통: `hid_write/WaitForSingleObject: (0x3E5)` — 디바이스가 USB 열거는 유지한 채
+///   OUT 리포트를 영원히 NAK → hidapi 1초 타임아웃. 재연결해도 똑같이 실패한다.
+/// - 분리: `WriteFile: (0x48F) 장치가 연결되지 않았습니다` / `(0x1F)` — 버스에서 빠짐.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WriteFailure {
+    Hung,
+    Gone,
+}
+
+pub fn classify_error(e: &dyn std::error::Error) -> WriteFailure {
+    let msg = e.to_string();
+    if msg.contains("WaitForSingleObject") || msg.contains("0x000003E5") {
+        WriteFailure::Hung
+    } else {
+        WriteFailure::Gone
+    }
+}
+
 /// HID 연결 관리자
 pub struct DeviceConnection {
     device: HidDevice,
@@ -31,31 +50,17 @@ pub struct DeviceConnection {
 }
 
 impl DeviceConnection {
-    /// HID 디바이스 연결 (interface 0)
+    /// HID 디바이스 연결 (interface 0).
+    /// 전체 HID 열거(`HidApi::new`)는 모든 장치를 열어 문자열을 읽기 때문에 먹통 장치가
+    /// 꽂혀 있으면 수십 초 걸렸다(로그: 재연결 1회 46초). 우리 VID/PID만 열거한다.
+    #[allow(deprecated)] // 앱 코드에서 열거 범위를 직접 제한하는 용도 — hidapi 2.6 안내와 일치
     pub fn connect(_com_port: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let api = HidApi::new()?;
 
         let dev_info = api.device_list()
-            .find(|d| {
-                d.vendor_id() == VENDOR_ID
-                    && d.product_id() == PRODUCT_ID
-                    && d.interface_number() == 0
-            })
-            .ok_or_else(|| {
-                // 목록 덤프는 프로세스당 1회만 — 3초 재시도마다 찍으면 파일 로그가 폭주한다
-                static LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !LISTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::warn!("HID 디바이스 목록:");
-                    for dev in api.device_list() {
-                        log::warn!("  VID={:#06x} PID={:#06x} page={:#06x} if={} {:?}",
-                            dev.vendor_id(), dev.product_id(),
-                            dev.usage_page(), dev.interface_number(),
-                            dev.product_string().unwrap_or_default());
-                    }
-                }
-                format!("Robobloq HID 디바이스를 찾을 수 없음 (VID={:#06x}, PID={:#06x})",
-                    VENDOR_ID, PRODUCT_ID)
-            })?;
+            .find(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID && d.interface_number() == 0)
+            .ok_or_else(|| format!("Robobloq HID 디바이스를 찾을 수 없음 (VID={:#06x}, PID={:#06x})",
+                VENDOR_ID, PRODUCT_ID))?;
 
         let path = dev_info.path().to_owned();
         let device = api.open_path(&path)?;
@@ -64,10 +69,24 @@ impl DeviceConnection {
         log::info!("HID 디바이스 연결: VID={:#06x}, PID={:#06x} (interface 0)",
             VENDOR_ID, PRODUCT_ID);
 
-        Ok(Self {
-            device,
-            mac: [0u8; 6],
-        })
+        let conn = Self { device, mac: [0u8; 6] };
+        conn.drain_input();
+        Ok(conn)
+    }
+
+    /// 열기 직전까지 디바이스 IN 큐에 남아 있던 응답(이전 프로세스가 읽지 않은 것)을 버린다.
+    /// 남은 개수는 먹통 원인 추적용 증거라 로그에 남긴다.
+    fn drain_input(&self) {
+        let mut buf = [0u8; 256];
+        let mut n_stale = 0u32;
+        while let Ok(n) = self.device.read_timeout(&mut buf, 0) {
+            if n == 0 { break; }
+            n_stale += 1;
+            if n_stale >= 64 { break; }
+        }
+        if n_stale > 0 {
+            log::warn!("연결 시 읽지 않은 응답 {}건 폐기 (이전 세션이 남긴 IN 리포트)", n_stale);
+        }
     }
 
     /// HID Output Report로 전송 (Report ID 0x00 + 데이터)
@@ -108,31 +127,26 @@ impl DeviceConnection {
         }
     }
 
-    /// 디바이스 초기화 (MAC 획득)
-    pub fn init_device(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// 디바이스 초기화 (MAC 획득). 응답을 받았으면 true.
+    /// false = 열거는 되지만 응답 경로가 죽은 "반먹통" (스트리밍은 될 수 있음, 로그 2026-10-15 20:03).
+    pub fn init_device(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         let packet = protocol::get_device_info();
         let resp = self.write_with_response(&packet)?;
 
-        if let Some(r) = resp {
-            if r.payload.len() >= 7 {
+        let responded = match resp {
+            Some(r) if r.payload.len() >= 7 => {
                 self.mac.copy_from_slice(&r.payload[1..7]);
                 log::info!("디바이스 MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     self.mac[0], self.mac[1], self.mac[2],
                     self.mac[3], self.mac[4], self.mac[5]);
+                true
             }
-        } else {
-            log::warn!("getDeviceInfo 응답 없음 — 디바이스가 먹통 상태일 수 있음 (USB 재연결 필요 가능성)");
-        }
+            Some(_) => true,
+            None => false,
+        };
 
         std::thread::sleep(Duration::from_millis(80));
-        Ok(())
-    }
-
-    /// 디바이스 생존 확인 — getDeviceInfo에 응답이 오면 true.
-    /// 먹통(펌웨어 hang) 상태면 enumeration은 살아 있어도 응답이 없다.
-    pub fn probe(&self) -> bool {
-        let packet = protocol::get_device_info();
-        matches!(self.write_with_response(&packet), Ok(Some(_)))
+        Ok(responded)
     }
 
     // ── 화면 동기화 ──
